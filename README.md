@@ -1,4 +1,4 @@
-# Kubernetes Production Incident / Trace-Correlation Lab v4
+# Kubernetes Production Incident / Trace-Correlation Lab v5
 
 A disposable Kubernetes lab designed to practice production-style incident investigation and
 customer trace correlation across multiple pods.
@@ -56,14 +56,14 @@ discovers correlation IDs, searches other pods, and reconstructs a chronological
 - Internet access the first time images are pulled/built if Docker does not already have them.
 - A Linux shell, WSL, Git Bash, or similar environment for scripts.
 
-The lab is intended for a disposable kind cluster named `incident-debug-lab`.
+The lab is intended for a disposable K3s cluster named `incident-debug-lab`.
 Do NOT point these scripts at a production cluster.
 
 ## Start
 
     ./scripts/lab.sh up
 
-The command creates a kind cluster, builds the service image, loads it into kind,
+The command creates a K3s cluster, builds the service image, loads it into kind,
 and deploys the complete chain.
 
 Then:

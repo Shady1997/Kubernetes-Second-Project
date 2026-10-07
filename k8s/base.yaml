@@ -37,7 +37,7 @@ spec:
     spec:
       containers:
       - name: customer-service
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/service.py"]
         ports:
@@ -99,7 +99,7 @@ spec:
     spec:
       containers:
       - name: session-service
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/service.py"]
         ports:
@@ -161,7 +161,7 @@ spec:
     spec:
       containers:
       - name: attestation-service
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/service.py"]
         ports:
@@ -223,7 +223,7 @@ spec:
     spec:
       containers:
       - name: legacy-service
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/service.py"]
         ports:
@@ -285,7 +285,7 @@ spec:
     spec:
       containers:
       - name: payment-service
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/service.py"]
         ports:
@@ -355,7 +355,7 @@ spec:
     spec:
       containers:
       - name: traffic-generator
-        image: incident-lab:v4
+        image: incident-lab:v5
         imagePullPolicy: IfNotPresent
         command: ["python","/app/traffic.py"]
         env:
