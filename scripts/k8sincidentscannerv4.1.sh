@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Kubernetes Incident Diagnostic Scanner v5
+# Kubernetes Incident Diagnostic Scanner v5.1
 #
 # READ-ONLY / NON-MUTATING KUBERNETES RESOURCE SCANNER.
 # (Not "zero side effects": see the kubectl exec note below.)
@@ -47,6 +47,9 @@
 # cause, SINCE (UTC), DURATION and owner. Also saved as terminal-summary.txt. It
 # ends by pointing to index.html for the full detail. Optional env vars:
 #   TERMINAL_WIDTH (default: auto)   TERMINAL_MAX_ROWS_PER_LAYER (default: 20)
+#
+# QUIET MODE (v5.1): while scanning, only a progress bar is shown; all detail goes to
+# data/scan-console.log and the HTML report. SCAN_VERBOSE=1 prints every finding live.
 #
 # It requires NO public internet access -- only connectivity to your
 # Kubernetes API server via the existing kubeconfig, and writes report
@@ -139,7 +142,7 @@ if [ "$FIRST_RUN" = "1" ]; then
 fi
 
 echo "============================================================"
-echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v5"
+echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v5.1"
 echo "============================================================"
 echo ""
 
@@ -556,7 +559,9 @@ now_ms() {
 # rather than "unset" (":-" would have overridden an empty string back
 # to the default, which is not what "set it empty to disable" should do).
 if [ -z "${NOISE_EXCLUDE_PATTERN+set}" ]; then
-    NOISE_EXCLUDE_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]+I[0-9]{4}[[:space:]]'
+    # v5.1: besides klog Info lines, also ignore logfmt/JSON lines whose level is INFO/DEBUG -- words like
+    # 'failure_mode="none"' or 'error_count=0' in a healthy INFO line are not errors.
+    NOISE_EXCLUDE_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]+I[0-9]{4}[[:space:]]|(^|[[:space:]])level="?(INFO|info|DEBUG|debug)"?([[:space:]]|$)|"level"[[:space:]]*:[[:space:]]*"(INFO|info|DEBUG|debug)"'
 fi
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -637,6 +642,36 @@ fmt_duration() {
     fi
 }
 # END_V5_HELPERS
+
+# --- v5.1: quiet mode + progress bar -----------------------------------------
+# While the scan runs, everything it would print goes to data/scan-console.log and
+# only a one-line progress bar reaches the terminal (via fd 4). SCAN_VERBOSE=1 turns
+# quiet mode off and prints every finding live, as v4/v5 did.
+PROGRESS_FD_OPEN=0; PROGRESS_TTY=0; PROGRESS_COLS=120
+NS_IDX=0; NS_TOTAL=1; POD_IDX=0; POD_N=1
+progress() {
+    # $1 percent  $2 label  $3 "s" = stage (also printed as a line when output is not a terminal)
+    [ "$PROGRESS_FD_OPEN" = "1" ] || return 0
+    local pct="$1" label="$2" kind="${3:-}" width=28 filled maxl bar el
+    local full="############################" empty="----------------------------"
+    case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+    [ "$pct" -gt 100 ] && pct=100
+    filled=$(( pct * width / 100 ))
+    bar="${full:0:filled}${empty:0:width-filled}"
+    el=$(( SECONDS - SCAN_RUN_START ))
+    if [ "$PROGRESS_TTY" = "1" ]; then
+        maxl=$(( PROGRESS_COLS - width - 20 )); [ "$maxl" -lt 10 ] && maxl=10
+        printf '\r\033[K  [%s] %3d%%  %4ss  %s' "$bar" "$pct" "$el" "${label:0:maxl}" >&4
+    elif [ "$kind" = "s" ]; then
+        printf '  [%s] %3d%%  %4ss  %s\n' "$bar" "$pct" "$el" "$label" >&4
+    fi
+}
+progress_pods() {
+    local pct
+    pct=$(( 24 + ( (NS_IDX - 1) * 1000 + POD_IDX * 1000 / POD_N ) * 56 / (NS_TOTAL * 1000) ))
+    progress "$pct" "Scanning pods: $NS ($POD_IDX/$POD_N) $POD"
+}
+
 
 # Redact credential-shaped strings before they land in the human-facing
 # report (ERROR_REPORT excerpts, search-match context, catalog details,
@@ -759,7 +794,23 @@ set_redis_status() {
 
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
-section() { echo ""; echo "===================================================================="; echo "$1"; echo "===================================================================="; echo ""; }
+section_header() { echo ""; echo "===================================================================="; echo "$1"; echo "===================================================================="; echo ""; }
+section() {
+    section_header "$1"
+    case "$1" in
+        "1. KUBERNETES CONTROL PLANE") progress 3  "Checking control plane and API latency" s ;;
+        "1C. ETCD"*)                   progress 7  "Checking etcd" s ;;
+        "2. NODE HEALTH")              progress 11 "Checking nodes" s ;;
+        "3. CLUSTER EVENTS")           progress 19 "Reading cluster events" s ;;
+        "NAMESPACE: "*)                NS_IDX=$((NS_IDX+1)); progress $(( 24 + (NS_IDX-1)*56/NS_TOTAL )) "Scanning namespace ${1#NAMESPACE: } ($NS_IDX/$NS_TOTAL)" s ;;
+        "5. CORE DNS")                 progress 81 "Checking CoreDNS" s ;;
+        "6. INGRESS"*)                 progress 85 "Checking ingress / proxies" s ;;
+        "6B. F5"*)                     progress 89 "Checking external load balancer" s ;;
+        "7. RESOURCE"*)                progress 91 "Checking storage and resource usage" s ;;
+        "8. ROOT CAUSE"*)              progress 94 "Correlating root causes" s ;;
+        "9. FINAL SUMMARY")            progress 97 "Building HTML / text reports" s ;;
+    esac
+}
 
 log()      { echo "[$(timestamp)] $1" >> "$REPORT"; }
 info()     { INFO=$((INFO+1)); echo -e "${CYAN}[INFO]${NC} $1"; echo "[INFO] $1" >> "$REPORT"; }
@@ -936,6 +987,17 @@ CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null)
 log "Context: $CURRENT_CONTEXT"
 log "Scan window: last ${SCAN_MINUTES} minutes ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)"
 log "Search mode: $SEARCH_MODE (${SEARCH_VALUE:-none})"
+
+# v5.1: quiet mode -- from here on, scan output goes to data/scan-console.log; terminal shows progress only.
+SCAN_RUN_START=$SECONDS
+if [ "${SCAN_VERBOSE:-0}" != "1" ]; then
+    exec 4>&1
+    [ -t 1 ] && PROGRESS_TTY=1
+    PROGRESS_COLS=$(tput cols 2>/dev/null); PROGRESS_COLS=${PROGRESS_COLS:-120}
+    exec >> "$REPORT_DIR/data/scan-console.log" 2>&1
+    PROGRESS_FD_OPEN=1
+fi
+progress 1 "Starting scan" s
 
 kubectl version >> "$REPORT" 2>&1
 kubectl cluster-info >> "$REPORT" 2>&1
@@ -1300,6 +1362,7 @@ case "$SCOPE_MODE" in
 esac
 
 REDIS_FOUND=0
+NS_IDX=0; NS_TOTAL=$(echo "$NAMESPACE_LIST" | wc -w | tr -d " "); [ "${NS_TOTAL:-0}" -lt 1 ] && NS_TOTAL=1
 
 for NS in $NAMESPACE_LIST; do
     section "NAMESPACE: $NS"
@@ -1513,8 +1576,10 @@ for NS in $NAMESPACE_LIST; do
         done)
     fi
 
+    POD_IDX=0; POD_N=$(echo "$POD_LIST" | grep -c .); [ "${POD_N:-0}" -lt 1 ] && POD_N=1
     for POD in $POD_LIST; do
         POD_TOTAL=$((POD_TOTAL+1))
+        POD_IDX=$((POD_IDX+1)); progress_pods
         POD_STATUS=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
         POD_IP=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.podIP}' 2>/dev/null)
         NODE_NAME=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
@@ -2545,7 +2610,7 @@ print_terminal_summary() {
     nodes_notready=$(awk -F'\t' '$2=="NODE_NOT_READY"{print $4}' "$FACTS_FILE" | sort -u | grep -c .)
     nodes_with=$(awk -F'\t' '$2 ~ /^NODE_/{print $4}' "$FACTS_FILE" | sort -u | grep -c .)
     svc_total=$(grep -c . "$REPORT_DIR/data/service-topology.tsv" 2>/dev/null); svc_total=${svc_total:-0}
-    svc_with=$(awk -F'\t' '$2=="NO_ENDPOINTS" || $2=="PARTIAL_NOT_READY"{print $3"/"$4}' "$FACTS_FILE" | sort -u | grep -c .)
+    svc_with=$(awk -F'\t' '$2=="NO_ENDPOINTS"{print $3"/"$4}' "$FACTS_FILE" | sort -u | grep -c .)
     read -r ep_ready ep_notready < <(awk -F'\t' '{r+=split($4,a," "); nr+=split($5,b," ")} END{print r+0, nr+0}' "$REPORT_DIR/data/service-topology.tsv" 2>/dev/null)
     pods_with=$(awk -F'\t' '$3!="-" && $2 !~ /^(NO_ENDPOINTS|PARTIAL_NOT_READY|HPA_|PVC_|JOB_|CRONJOB_|STATEFULSET_|F5_|HAPROXY|PROBE|NODE_)/{split($4,p,"/"); print $3"/"p[1]}' "$FACTS_FILE" | sort -u | grep -c .)
     n_crit=$(awk -F'\t' '$3=="CRIT"' "$TERM_ROWS_FILE" | grep -c .)
@@ -2591,17 +2656,12 @@ print_terminal_summary() {
     fi
 
     echo ""
-    echo " How to read this:"
-    echo "   SINCE    = when the problem started / was first seen (UTC). Log findings: first matching log line in the scan window. Restart/OOM: time of the last crash."
-    echo "   DURATION = SINCE -> now. A trailing * on SINCE = start time unknown (scan time shown, DURATION 'at scan')."
-    echo "   ROOT CAUSE = EXPECTED cause inferred from status/log patterns -- a lead to verify, not proof."
-    echo "   OWNER    = Dev=Developer  Net=Network  Sec=Security  Triage=needs joint review"
+    echo " Notes: a trailing * on SINCE = start time unknown (scan time shown). Root causes are expected causes to verify, not proof."
     echo ""
     echo "$LINE"
-    echo " ${B}NEED MORE DETAIL?${NC0}  Open the HTML report for full logs and stack traces, root-cause chains,"
-    echo " service topology, resource usage, event timeline and the exact read-only commands to confirm each finding:"
-    echo "     ${B}$(cd "$REPORT_DIR" 2>/dev/null && pwd)/index.html${NC0}"
-    echo " Plain-text versions in the same folder: root-cause-analysis.txt, error-catalog.txt, errors-and-warnings.txt"
+    echo " ${B}Need more details?${NC0}  Check the HTML report (full logs, stack traces, root-cause chains, topology, commands):"
+    echo "   ${B}$(cd "$REPORT_DIR" 2>/dev/null && pwd)/index.html${NC0}"
+    [ -n "$SEARCH_VALUE" ] && echo "   Search matches with context: $(cd "$REPORT_DIR" 2>/dev/null && pwd)/search-matches.txt"
     echo "$LINE"
 }
 # END_V5_TERMINAL
@@ -3065,43 +3125,17 @@ THIS SCAN IS READ-ONLY with respect to Kubernetes objects. Endpoint probes
 reads data you point it at. No Kubernetes resource was modified.
 EOF
 
-echo ""
-echo "===================================================================="
-echo "SCAN COMPLETE"
-echo "===================================================================="
-echo -e "${RED}Critical : $CRITICAL${NC}"
-echo -e "${RED}Errors   : $ERRORS${NC}"
-echo -e "${YELLOW}Warnings : $WARNINGS${NC}"
-echo -e "${CYAN}Info     : $INFO${NC}"
-if [ -n "$SEARCH_VALUE" ]; then
-    echo "Search '$SEARCH_VALUE': $SEARCH_OCCURRENCES occurrence(s) across $MATCHES source(s), $SEARCH_RESOURCES resource(s), $SEARCH_NAMESPACES namespace(s)" | highlight_term
-    if [ -s "$MATCH_REPORT" ]; then
-        echo ""
-        echo "--- Search match preview (first 60 lines; full file: $MATCH_REPORT) ---"
-        head -60 "$MATCH_REPORT" | highlight_term
-        echo "--- end of preview ---"
-    fi
+# v5.1: leave quiet mode, then show only the summary table and one pointer sentence.
+if [ "$PROGRESS_FD_OPEN" = "1" ]; then
+    progress 100 "Scan complete" s
+    [ "$PROGRESS_TTY" = "1" ] && printf '\n' >&4
+    exec 1>&4 2>&4 4>&-
+    PROGRESS_FD_OPEN=0
 fi
-echo "Root-cause candidates : $ROOT_CAUSE_COUNT (see $ROOTCAUSE_REPORT or index.html)"
-if [ "$ENABLE_ENDPOINT_PROBE" = "1" ]; then
-    echo "Endpoint probes        : $PROBE_TOTAL probed, $PROBE_FAIL_COUNT failed (see $PROBE_REPORT or index.html)"
-else
-    echo "Endpoint probes        : disabled (set ENABLE_ENDPOINT_PROBE=1 to enable)"
-fi
-if [ -n "$F5_LOG_SOURCE$F5_LOG_HOOK" ]; then
-    echo "F5/external LB         : $F5_MATCHES_COUNT match(es) (see index.html)"
-else
-    echo "F5/external LB         : not configured (set F5_LOG_SOURCE and/or F5_LOG_HOOK to enable)"
-fi
-echo ""
-# v5: per-layer terminal summary table (also saved as terminal-summary.txt)
 build_terminal_rows
 print_terminal_summary 0 > "$REPORT_DIR/terminal-summary.txt"
 if [ -t 1 ]; then print_terminal_summary 1; else print_terminal_summary 0; fi
-echo "Report directory : $REPORT_DIR"
-echo "HTML report       : $HTML_REPORT"
-echo ""
-echo "No Kubernetes resource was modified by this scan."
+echo " No Kubernetes resource was modified by this scan."
 
 if should_exit_after_run; then
     echo ""
@@ -3110,8 +3144,6 @@ if should_exit_after_run; then
 fi
 
 echo ""
-echo "===================================================================="
 echo "Returning to the first question... (Ctrl+C to exit)"
-echo "===================================================================="
 
 done
